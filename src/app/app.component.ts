@@ -3,7 +3,7 @@ import { Component, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatChipsModule } from '@angular/material/chips';
-import { MatDialogModule } from '@angular/material/dialog';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
@@ -17,16 +17,19 @@ import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatToolbarModule } from '@angular/material/toolbar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { Store } from '@ngrx/store';
+import { ChangeCenterComponent } from './components/change-center/change-center.component';
 import { DataGridComponent, GridColumn } from './components/data-grid/data-grid.component';
 import { FilterBuilderComponent } from './components/filter-builder/filter-builder.component';
 import * as TableActions from './stores/table.actions';
 import {
   selectAllColumnDefinitions,
+  selectConflictCount,
   selectPageCount,
+  selectPendingCount,
   selectTableState,
   selectVisibleColumnDefinitions,
 } from './stores/table.selectors';
-import { FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
+import { CellValue, FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
 
 @Component({
   selector: 'app-root',
@@ -121,6 +124,30 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             <span>当前选择</span>
             <strong>{{ state.selectedIds.length }} 行</strong>
           </div>
+          <div class="metric">
+            <span>数据版本</span>
+            <strong>v{{ state.dataVersion }}</strong>
+          </div>
+        </div>
+
+        <mat-divider />
+
+        <div class="side-panel__section">
+          <p class="side-panel__eyebrow">会话与变更</p>
+          <button class="view-link" type="button" (click)="openChangeCenter()">
+            <mat-icon>sync_alt</mat-icon>
+            变更中心
+            @if (pendingCount()) {
+              <span class="pill pill--pending">{{ pendingCount() }} 待提交</span>
+            }
+            @if (conflictCount()) {
+              <span class="pill pill--conflict">{{ conflictCount() }} 冲突</span>
+            }
+          </button>
+          <button class="view-link" type="button" (click)="simulateExternal()">
+            <mat-icon>group_work</mat-icon>
+            模拟其他标签页保存
+          </button>
         </div>
 
         <mat-divider />
@@ -139,19 +166,52 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           <div>
             <span class="breadcrumb">订单中心 / 销售订单</span>
             <h1>销售订单明细</h1>
-            <p>服务端分页查询、复杂表达式筛选、聚合分析与可复用列视图。</p>
+            <p>查询编辑会话：版本化查询结果、单元格版本仲裁、批量保存与可恢复快照。</p>
           </div>
           <div class="page-actions">
             <button mat-stroked-button type="button" (click)="refresh()">
               <mat-icon>refresh</mat-icon>
               刷新
             </button>
-            <button mat-flat-button color="primary" type="button" (click)="exportCsv()">
+            <button mat-stroked-button type="button" [matMenuTriggerFor]="exportMenu">
               <mat-icon>download</mat-icon>
-              导出本页
+              导出
+            </button>
+            <mat-menu #exportMenu="matMenu">
+              <button mat-menu-item (click)="exportSession()">
+                <mat-icon>sync_alt</mat-icon>
+                <span>导出会话（已保存 / 待提交 / 冲突）</span>
+              </button>
+              <button mat-menu-item (click)="exportCsv()">
+                <mat-icon>table_view</mat-icon>
+                <span>导出本页 CSV</span>
+              </button>
+            </mat-menu>
+            <button
+              mat-flat-button
+              color="primary"
+              type="button"
+              [disabled]="!pendingCount() || state.saving"
+              (click)="saveAll()"
+            >
+              <mat-icon>save</mat-icon>
+              保存全部{{ pendingCount() ? '（' + pendingCount() + '）' : '' }}
             </button>
           </div>
         </section>
+
+        @if (state.stale) {
+          <div class="stale-banner">
+            <mat-icon>info</mat-icon>
+            <span>服务端数据已更新，当前查询结果已过期，正在用新版本重新查询…</span>
+          </div>
+        }
+        @if (state.error) {
+          <div class="error-banner">
+            <mat-icon>error_outline</mat-icon>
+            <span>查询失败：{{ state.error }}。已保留当前快照与未提交修改，可点击刷新重试。</span>
+          </div>
+        }
 
         <section class="toolbar-panel">
           <div class="toolbar-row">
@@ -191,6 +251,30 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
               {{ state.treeMode ? '树形模式' : '普通模式' }}
             </button>
             <span class="spacer"></span>
+            <button
+              mat-stroked-button
+              type="button"
+              [class.has-changes]="pendingCount()"
+              (click)="openChangeCenter()"
+            >
+              <mat-icon>edit_note</mat-icon>
+              待提交
+              @if (pendingCount()) {
+                <span class="count-badge count-badge--pending">{{ pendingCount() }}</span>
+              }
+            </button>
+            <button
+              mat-stroked-button
+              type="button"
+              [class.has-conflicts]="conflictCount()"
+              (click)="openChangeCenter()"
+            >
+              <mat-icon>warning_amber</mat-icon>
+              冲突
+              @if (conflictCount()) {
+                <span class="count-badge count-badge--conflict">{{ conflictCount() }}</span>
+              }
+            </button>
             <button mat-stroked-button type="button" [matMenuTriggerFor]="columnMenu">
               <mat-icon>view_column</mat-icon>
               列配置
@@ -260,8 +344,15 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             <strong>{{ state.total | number }}</strong> 条结果
             <span class="muted">· 第 {{ state.page + 1 }} / {{ pageCount() }} 页</span>
             <span class="muted">· 查询 {{ state.elapsedMs }}ms</span>
+            <span class="muted">· 数据版本 v{{ state.dataVersion }}</span>
             @if (state.selectedIds.length) {
               <span class="selection-note">已选择 {{ state.selectedIds.length }} 行</span>
+            }
+            @if (pendingCount()) {
+              <span class="selection-note selection-note--pending">{{ pendingCount() }} 项待提交</span>
+            }
+            @if (conflictCount()) {
+              <span class="selection-note selection-note--conflict">{{ conflictCount() }} 项冲突</span>
             }
             <span class="spacer"></span>
             <span class="muted">双击单元格可内联编辑</span>
@@ -276,7 +367,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             [density]="state.density"
             [sort]="state.sort"
             [selectedIds]="state.selectedIds"
-            [dirtyCells]="state.dirtyCells"
+            [dirtyCells]="dirtyCellValues()"
             [expandedIds]="state.expandedIds"
             [treeMode]="state.treeMode"
             (sortChange)="changeSort($event)"
@@ -371,7 +462,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       background: #eef2f7;
     }
     .side-panel {
-      width: 224px;
+      width: 240px;
       border: 0;
       border-right: 1px solid #d8e0eb;
       background: #fbfcfe;
@@ -474,6 +565,26 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       display: flex;
       gap: 8px;
     }
+    .stale-banner,
+    .error-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    .stale-banner {
+      border: 1px solid #fedf89;
+      background: #fffaeb;
+      color: #b54708;
+    }
+    .error-banner {
+      border: 1px solid #fecdca;
+      background: #fef3f2;
+      color: #b42318;
+    }
     .toolbar-panel {
       padding: 14px;
       border: 1px solid #dce3ec;
@@ -503,6 +614,20 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       background: #175cd3;
       color: #fff;
       font-size: 10px;
+    }
+    .count-badge--pending {
+      background: #b54708;
+    }
+    .count-badge--conflict {
+      background: #b42318;
+    }
+    .has-changes {
+      border-color: #f79009;
+      color: #b54708;
+    }
+    .has-conflicts {
+      border-color: #b42318;
+      color: #b42318;
     }
     .menu-title {
       padding: 8px 16px 4px;
@@ -608,6 +733,12 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       margin-left: 12px;
       color: #175cd3;
     }
+    .selection-note--pending {
+      color: #b54708;
+    }
+    .selection-note--conflict {
+      color: #b42318;
+    }
     app-data-grid {
       min-height: 0;
       flex: 1;
@@ -632,11 +763,14 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
 export class AppComponent {
   private readonly store = inject(Store);
   private readonly snackBar = inject(MatSnackBar);
+  private readonly dialog = inject(MatDialog);
 
   readonly tableState = this.store.selectSignal(selectTableState);
   readonly allColumns = this.store.selectSignal(selectAllColumnDefinitions);
   readonly visibleColumns = this.store.selectSignal(selectVisibleColumnDefinitions) as unknown as () => GridColumn[];
   readonly pageCount = this.store.selectSignal(selectPageCount);
+  readonly pendingCount = this.store.selectSignal(selectPendingCount);
+  readonly conflictCount = this.store.selectSignal(selectConflictCount);
   readonly showFilterPanel = signal(false);
   readonly conditionCount = computed(() => this.countConditions(this.tableState().filter));
   readonly compactAmount = computed(() => {
@@ -650,9 +784,18 @@ export class AppComponent {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
   }
 
+  /** 传给网格的脏单元格值映射（网格只需判断哪些单元格有本地覆盖） */
+  dirtyCellValues(): Record<string, CellValue> {
+    const result: Record<string, CellValue> = {};
+    for (const [key, pending] of Object.entries(this.tableState().dirtyCells)) {
+      result[key] = pending.value;
+    }
+    return result;
+  }
+
   refresh(): void {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
-    this.snackBar.open('已刷新模拟服务端数据', '关闭', { duration: 1800 });
+    this.snackBar.open('已发起新的查询会话', '关闭', { duration: 1800 });
   }
 
   setSearch(search: string): void {
@@ -735,7 +878,7 @@ export class AppComponent {
 
   updateCell(event: { id: string; key: keyof TableRow; value: string | number | boolean | null }): void {
     this.store.dispatch(TableActions.updateCell(event));
-    this.snackBar.open('单元格已更新，将进入待提交变更区', '关闭', { duration: 1600 });
+    this.snackBar.open('单元格已更新，进入待提交变更区', '关闭', { duration: 1600 });
   }
 
   toggleExpand(id: string): void {
@@ -749,6 +892,24 @@ export class AppComponent {
   changePage(event: PageEvent): void {
     this.store.dispatch(TableActions.setPageSize({ pageSize: event.pageSize }));
     this.store.dispatch(TableActions.setPage({ page: event.pageIndex }));
+  }
+
+  saveAll(): void {
+    this.store.dispatch(TableActions.saveCells());
+    this.snackBar.open('已提交整批保存，成功项先入库，失败项进入冲突区', '关闭', { duration: 2200 });
+  }
+
+  simulateExternal(): void {
+    this.store.dispatch(TableActions.simulateExternalChange());
+    this.snackBar.open('已模拟其他标签页抢先保存，部分待提交项可能在保存时冲突', '关闭', { duration: 2600 });
+  }
+
+  openChangeCenter(): void {
+    this.dialog.open(ChangeCenterComponent, {
+      width: '760px',
+      maxWidth: '92vw',
+      autoFocus: false,
+    });
   }
 
   saveView(): void {
@@ -781,10 +942,64 @@ export class AppComponent {
     const rows = this.tableState().rows.map((row) =>
       columns.map((column) => `"${String(row[column.key] ?? '').replaceAll('"', '""')}"`).join(','),
     );
-    const blob = new Blob([`\uFEFF${[header, ...rows].join('\n')}`], { type: 'text/csv;charset=utf-8' });
+    this.downloadCsv(`销售订单-第${this.tableState().page + 1}页.csv`, [header, ...rows].join('\n'));
+  }
+
+  /** 导出会话：分别列出已保存值、待提交值与冲突项 */
+  exportSession(): void {
+    const state = this.tableState();
+    const columns = this.visibleColumns();
+    const lines: string[] = [];
+
+    lines.push('# 已保存值（服务端快照 v' + state.dataVersion + '）');
+    lines.push(columns.map((column) => column.label).join(','));
+    for (const row of state.serverRows) {
+      lines.push(
+        columns
+          .map((column) => `"${String(row[column.key] ?? '').replaceAll('"', '""')}"`)
+          .join(','),
+      );
+    }
+
+    lines.push('');
+    lines.push('# 待提交变更（未保存）');
+    lines.push('订单号,字段,待提交值,基于版本');
+    for (const [key, pending] of Object.entries(state.dirtyCells)) {
+      const sep = key.indexOf('::');
+      const id = key.slice(0, sep);
+      const field = key.slice(sep + 2);
+      const fieldLabel = columns.find((column) => String(column.key) === field)?.label ?? field;
+      lines.push(
+        [id, fieldLabel, `"${String(pending.value ?? '').replaceAll('"', '""')}"`, `v${pending.baseVersion}`].join(','),
+      );
+    }
+
+    lines.push('');
+    lines.push('# 冲突项（需重试）');
+    lines.push('订单号,字段,本地值,服务端值,原因');
+    for (const conflict of Object.values(state.conflicts)) {
+      const fieldLabel =
+        columns.find((column) => String(column.key) === String(conflict.field))?.label ??
+        String(conflict.field);
+      lines.push(
+        [
+          conflict.id,
+          fieldLabel,
+          `"${String(conflict.localValue ?? '').replaceAll('"', '""')}"`,
+          `"${String(conflict.serverValue ?? '').replaceAll('"', '""')}"`,
+          conflict.reason === 'missing' ? '订单不存在' : '版本落后',
+        ].join(','),
+      );
+    }
+
+    this.downloadCsv(`订单会话-v${state.dataVersion}.csv`, lines.join('\n'));
+  }
+
+  private downloadCsv(filename: string, content: string): void {
+    const blob = new Blob([`﻿${content}`], { type: 'text/csv;charset=utf-8' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `销售订单-第${this.tableState().page + 1}页.csv`;
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(link.href);
   }
@@ -801,7 +1016,7 @@ export class AppComponent {
       ...group,
       children: group.children
         .filter((child) => child.id !== id)
-        .map((child) => child.kind === 'group' ? this.removeNode(child, id) : child),
+        .map((child) => (child.kind === 'group' ? this.removeNode(child, id) : child)),
     };
   }
 }

@@ -3,13 +3,17 @@ import { Observable, of } from 'rxjs';
 import { delay } from 'rxjs/operators';
 import {
   AggregateResult,
+  CellEdit,
+  CellSaveResult,
   CellValue,
+  ExternalChangeResponse,
   FilterCondition,
   FilterGroup,
   FilterNode,
   GroupSummary,
   QueryRequest,
   QueryResult,
+  SaveCellsResponse,
   TableRow,
 } from '../types/table.models';
 
@@ -18,9 +22,22 @@ const CATEGORIES = ['云服务', '智能硬件', '企业软件', '数据服务',
 const OWNERS = ['陈嘉', '林月', '周砺', '许宁', '韩舟', '顾清', '沈河', '陆遥'];
 const STATUSES: TableRow['status'][] = ['待审核', '进行中', '已发货', '已完成', '异常'];
 
+function cellKey(id: string, field: keyof TableRow): string {
+  return `${id}::${String(field)}`;
+}
+
 @Injectable({ providedIn: 'root' })
 export class MockTableApiService {
   private readonly rows: TableRow[] = this.createRows(50000);
+  private readonly rowMap = new Map<string, TableRow>();
+  /** 服务端数据版本：每次成功保存或外部变更后递增 */
+  private dataVersion = 1;
+  /** 各单元格的服务端版本，键为 `${id}::${field}`，未记录时视为 1 */
+  private readonly cellVersions = new Map<string, number>();
+
+  constructor() {
+    this.rows.forEach((row) => this.rowMap.set(row.id, row));
+  }
 
   query(request: QueryRequest): Observable<QueryResult> {
     const startedAt = performance.now();
@@ -52,6 +69,14 @@ export class MockTableApiService {
       );
     }
 
+    const versions: Record<string, number> = {};
+    for (const row of pageRows) {
+      for (const field of Object.keys(row) as Array<keyof TableRow>) {
+        if (field === 'id' || field === 'parentId') continue;
+        versions[cellKey(row.id, field)] = this.getVersion(row.id, field);
+      }
+    }
+
     const elapsedMs = Math.max(8, Math.round(performance.now() - startedAt + 18));
     return of({
       rows: pageRows,
@@ -59,11 +84,152 @@ export class MockTableApiService {
       aggregates: this.aggregate(sorted),
       groups,
       elapsedMs,
+      sessionId: request.sessionId,
+      dataVersion: this.dataVersion,
+      versions,
     }).pipe(delay(request.page > 8 ? 120 : 55));
+  }
+
+  /**
+   * 批量保存：逐项独立裁决，成功的先入库，失败项保留为冲突。
+   * 不会因为某一项失败而回退其他已成功的项。
+   */
+  saveCells(edits: CellEdit[]): Observable<SaveCellsResponse> {
+    const results: CellSaveResult[] = [];
+    let applied = false;
+
+    for (const edit of edits) {
+      const row = this.rowMap.get(edit.id);
+      if (!row) {
+        results.push({
+          id: edit.id,
+          field: edit.field,
+          status: 'missing',
+          localValue: edit.value,
+          serverValue: null,
+          serverVersion: 0,
+          baseVersion: edit.baseVersion,
+        });
+        continue;
+      }
+
+      const currentVersion = this.getVersion(edit.id, edit.field);
+      if (edit.baseVersion !== currentVersion) {
+        // 落后于服务端：不覆盖，留在冲突区等待重试
+        results.push({
+          id: edit.id,
+          field: edit.field,
+          status: 'conflict',
+          localValue: edit.value,
+          serverValue: row[edit.field],
+          serverVersion: currentVersion,
+          baseVersion: edit.baseVersion,
+        });
+        continue;
+      }
+
+      row[edit.field] = edit.value;
+      const nextVersion = currentVersion + 1;
+      this.cellVersions.set(cellKey(edit.id, edit.field), nextVersion);
+      applied = true;
+      results.push({
+        id: edit.id,
+        field: edit.field,
+        status: 'saved',
+        value: edit.value,
+        version: nextVersion,
+        localValue: edit.value,
+        baseVersion: edit.baseVersion,
+      });
+    }
+
+    if (applied) {
+      this.dataVersion += 1;
+    }
+
+    return of({ results, dataVersion: this.dataVersion }).pipe(delay(40));
+  }
+
+  /**
+   * 模拟“另一个标签页”先保存了一批单元格：
+   * 随机提升若干单元格的服务端版本并改动其值，
+   * 使本会话基于旧版本的待提交项在保存时落入冲突区。
+   */
+  simulateExternalChange(pendingKeys: string[]): Observable<ExternalChangeResponse> {
+    const affected: string[] = [];
+    const versions: Record<string, number> = {};
+
+    // 保证至少有一个待提交项被“对面标签页”抢先保存
+    const shuffled = [...pendingKeys].sort(() => Math.random() - 0.5);
+    const bumpCount = pendingKeys.length
+      ? Math.max(1, Math.ceil(pendingKeys.length * (0.4 + Math.random() * 0.4)))
+      : 0;
+    for (const key of shuffled.slice(0, bumpCount)) {
+      const [id, field] = this.splitKey(key);
+      if (this.bumpCell(id, field)) {
+        affected.push(key);
+        versions[key] = this.getVersion(id, field);
+      }
+    }
+
+    // 再随机改动若干单元格，模拟服务端其他写入
+    for (let i = 0; i < 3; i += 1) {
+      const row = this.rows[Math.floor(Math.random() * this.rows.length)];
+      const fields: Array<keyof TableRow> = ['amount', 'quantity', 'margin', 'status', 'owner'];
+      const field = fields[Math.floor(Math.random() * fields.length)];
+      const key = cellKey(row.id, field);
+      if (this.bumpCell(row.id, field)) {
+        if (!affected.includes(key)) {
+          affected.push(key);
+          versions[key] = this.getVersion(row.id, field);
+        }
+      }
+    }
+
+    if (affected.length) {
+      this.dataVersion += 1;
+    }
+
+    return of({ affected, dataVersion: this.dataVersion, versions }).pipe(delay(30));
   }
 
   getDatasetSize(): number {
     return this.rows.length;
+  }
+
+  private getVersion(id: string, field: keyof TableRow): number {
+    return this.cellVersions.get(cellKey(id, field)) ?? 1;
+  }
+
+  private splitKey(key: string): [string, keyof TableRow] {
+    const idx = key.indexOf('::');
+    return [key.slice(0, idx), key.slice(idx + 2) as keyof TableRow];
+  }
+
+  /** 提升单元格版本并改动其值，返回是否成功 */
+  private bumpCell(id: string, field: keyof TableRow): boolean {
+    const row = this.rowMap.get(id);
+    if (!row) return false;
+    const key = cellKey(id, field);
+    const nextVersion = this.getVersion(id, field) + 1;
+    this.cellVersions.set(key, nextVersion);
+
+    if (field === 'amount') {
+      row.amount = Math.round((row.amount + 1000 + Math.random() * 49000) * 100) / 100;
+    } else if (field === 'quantity') {
+      row.quantity = row.quantity + 1 + Math.floor(Math.random() * 20);
+    } else if (field === 'margin') {
+      row.margin = Math.round((row.margin + Math.random() * 5) * 10) / 10;
+    } else if (field === 'status') {
+      const idx = STATUSES.indexOf(row.status);
+      row.status = STATUSES[(idx + 1) % STATUSES.length];
+    } else if (field === 'owner') {
+      const current = OWNERS.indexOf(row.owner);
+      row.owner = OWNERS[(current + 1 + Math.floor(Math.random() * (OWNERS.length - 1))) % OWNERS.length];
+    }
+    // 字符串字段（customer/orderNo 等）只提升版本、不改值，
+    // 同样会因版本落后在保存时被裁决为冲突。
+    return true;
   }
 
   private filterRows(rows: TableRow[], filter: FilterGroup, search: string): TableRow[] {

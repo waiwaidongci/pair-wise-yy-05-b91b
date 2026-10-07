@@ -51,6 +51,16 @@ select {
   white-space: nowrap;
 }
 
+.pill--pending {
+  background: #fffaeb;
+  color: #b54708;
+}
+
+.pill--conflict {
+  background: #fef3f2;
+  color: #b42318;
+}
+
 .status {
   display: inline-flex;
   align-items: center;
