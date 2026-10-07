@@ -3,13 +3,17 @@ import { Observable, of } from 'rxjs';
 import { delay } from 'rxjs/operators';
 import {
   AggregateResult,
+  CellChange,
   CellValue,
+  ConflictItem,
   FilterCondition,
   FilterGroup,
   FilterNode,
   GroupSummary,
   QueryRequest,
   QueryResult,
+  SaveBatchResult,
+  SavedCell,
   TableRow,
 } from '../types/table.models';
 
@@ -18,13 +22,35 @@ const CATEGORIES = ['云服务', '智能硬件', '企业软件', '数据服务',
 const OWNERS = ['陈嘉', '林月', '周砺', '许宁', '韩舟', '顾清', '沈河', '陆遥'];
 const STATUSES: TableRow['status'][] = ['待审核', '进行中', '已发货', '已完成', '异常'];
 
+export const SERVER_STORAGE_KEY = 'pair-wise-yy-05:server';
+
+export interface ServerCell {
+  value: CellValue;
+  version: number;
+}
+
+export interface ServerSnapshot {
+  dataVersion: number;
+  cells: Record<string, ServerCell>;
+}
+
 @Injectable({ providedIn: 'root' })
 export class MockTableApiService {
   private readonly rows: TableRow[] = this.createRows(50000);
+  private readonly rowById = new Map(this.rows.map((row) => [row.id, row]));
+  private server: ServerSnapshot = this.readServer();
 
   query(request: QueryRequest): Observable<QueryResult> {
+    this.syncServer();
     const startedAt = performance.now();
-    const filtered = this.filterRows(this.rows, request.filter, request.search);
+    const overrides = this.overridesByRow();
+    const rows = overrides.size
+      ? this.rows.map((row) => {
+          const patch = overrides.get(row.id);
+          return patch ? { ...row, ...patch } : row;
+        })
+      : this.rows;
+    const filtered = this.filterRows(rows, request.filter, request.search);
     const sorted = this.sortRows(filtered, request.sort);
     const groups = request.groupBy ? this.groupRows(sorted, request.groupBy) : [];
 
@@ -59,11 +85,135 @@ export class MockTableApiService {
       aggregates: this.aggregate(sorted),
       groups,
       elapsedMs,
+      dataVersion: this.server.dataVersion,
+      cellVersions: this.cellVersionMap(this.server),
     }).pipe(delay(request.page > 8 ? 120 : 55));
+  }
+
+  saveBatch(changes: CellChange[]): Observable<SaveBatchResult> {
+    this.syncServer();
+    const cells = { ...this.server.cells };
+    const saved: SavedCell[] = [];
+    const conflicts: ConflictItem[] = [];
+
+    for (const change of changes) {
+      const cellKey = this.cellKey(change.id, change.key);
+      const current = cells[cellKey];
+      const currentVersion = current?.version ?? 0;
+      const row = this.rowById.get(change.id);
+      if (change.baseVersion !== currentVersion) {
+        conflicts.push({
+          id: change.id,
+          key: change.key,
+          orderNo: row?.orderNo ?? change.id,
+          localValue: change.value,
+          serverValue: current ? current.value : (row?.[change.key] ?? null),
+          serverVersion: currentVersion,
+        });
+        continue;
+      }
+      const version = currentVersion + 1;
+      cells[cellKey] = { value: change.value, version };
+      saved.push({ id: change.id, key: change.key, value: change.value, version });
+    }
+
+    if (saved.length) {
+      this.server = { dataVersion: this.server.dataVersion + 1, cells };
+      this.persistServer();
+    }
+
+    return of({
+      saved,
+      conflicts,
+      dataVersion: this.server.dataVersion,
+    }).pipe(delay(90));
+  }
+
+  /** 模拟另一个标签页对同一单元格的并发修改，用于演示版本冲突。 */
+  simulateExternalEdit(id: string, key: keyof TableRow): ServerSnapshot {
+    this.syncServer();
+    const cellKey = this.cellKey(id, key);
+    const current = this.server.cells[cellKey];
+    const row = this.rowById.get(id);
+    const baseValue = current ? current.value : (row?.[key] ?? null);
+    const value =
+      typeof baseValue === 'number'
+        ? Math.round((baseValue + 1) * 100) / 100
+        : `${String(baseValue ?? '')}·他端修改`;
+    this.server = {
+      dataVersion: this.server.dataVersion + 1,
+      cells: {
+        ...this.server.cells,
+        [cellKey]: { value, version: (current?.version ?? 0) + 1 },
+      },
+    };
+    this.persistServer();
+    return this.server;
+  }
+
+  cellVersionsOf(snapshot: ServerSnapshot): Record<string, number> {
+    return this.cellVersionMap(snapshot);
+  }
+
+  readServerSnapshot(): ServerSnapshot {
+    this.syncServer();
+    return this.server;
   }
 
   getDatasetSize(): number {
     return this.rows.length;
+  }
+
+  private cellKey(id: string, key: keyof TableRow): string {
+    return `${id}::${String(key)}`;
+  }
+
+  private overridesByRow(): Map<string, Record<string, CellValue>> {
+    const overrides = new Map<string, Record<string, CellValue>>();
+    for (const [cellKey, cell] of Object.entries(this.server.cells)) {
+      const [id, field] = cellKey.split('::');
+      const patch = overrides.get(id) ?? {};
+      patch[field] = cell.value;
+      overrides.set(id, patch);
+    }
+    return overrides;
+  }
+
+  private cellVersionMap(snapshot: ServerSnapshot): Record<string, number> {
+    return Object.fromEntries(
+      Object.entries(snapshot.cells).map(([key, cell]) => [key, cell.version]),
+    );
+  }
+
+  private syncServer(): void {
+    const snapshot = this.readServer();
+    // 数据版本单调递增，仅采纳更新的快照，避免存储不可用时回退内存态
+    if (snapshot.dataVersion > this.server.dataVersion) {
+      this.server = snapshot;
+    }
+  }
+
+  private readServer(): ServerSnapshot {
+    try {
+      const raw = localStorage.getItem(SERVER_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as ServerSnapshot;
+        if (parsed && typeof parsed.dataVersion === 'number' && parsed.cells) {
+          return parsed;
+        }
+      }
+    } catch {
+      // localStorage 不可用时退化为内存态
+    }
+    return { dataVersion: 1, cells: {} };
+  }
+
+  private persistServer(): void {
+    try {
+      localStorage.setItem(SERVER_STORAGE_KEY, JSON.stringify(this.server));
+    } catch {
+      // 忽略持久化失败，内存态仍然一致
+    }
   }
 
   private filterRows(rows: TableRow[], filter: FilterGroup, search: string): TableRow[] {

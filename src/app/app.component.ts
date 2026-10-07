@@ -19,14 +19,17 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { Store } from '@ngrx/store';
 import { DataGridComponent, GridColumn } from './components/data-grid/data-grid.component';
 import { FilterBuilderComponent } from './components/filter-builder/filter-builder.component';
+import { MockTableApiService, SERVER_STORAGE_KEY, ServerSnapshot } from './data/mock-table-api.service';
 import * as TableActions from './stores/table.actions';
 import {
   selectAllColumnDefinitions,
+  selectConflictItems,
   selectPageCount,
+  selectPendingChanges,
   selectTableState,
   selectVisibleColumnDefinitions,
 } from './stores/table.selectors';
-import { FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
+import { ConflictItem, FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
 
 @Component({
   selector: 'app-root',
@@ -242,6 +245,86 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           }
         </section>
 
+        @if (pendingChanges().length || conflictItems().length || state.saveError) {
+          <section class="session-panel">
+            <div class="session-panel__head">
+              <mat-icon>edit_note</mat-icon>
+              <div class="session-panel__title">
+                <strong>编辑会话</strong>
+                <span class="muted">
+                  待提交 {{ pendingChanges().length }} 项
+                  @if (conflictItems().length) {
+                    · 冲突 {{ conflictItems().length }} 项
+                  }
+                </span>
+              </div>
+              @if (state.saving) {
+                <span class="muted">正在保存…</span>
+              }
+              @if (state.saveError) {
+                <span class="save-error">保存失败：{{ state.saveError }}，未提交修改已保留</span>
+              }
+              <span class="spacer"></span>
+              <button
+                mat-stroked-button
+                type="button"
+                [disabled]="!pendingChanges().length || state.saving"
+                matTooltip="模拟另一个标签页修改首个待提交单元格，保存时将按单元格版本裁决"
+                (click)="simulateExternalEdit()"
+              >
+                <mat-icon>phonelink</mat-icon>
+                模拟他端修改
+              </button>
+              <button
+                mat-stroked-button
+                type="button"
+                [disabled]="!pendingChanges().length || state.saving"
+                (click)="discardAll()"
+              >
+                <mat-icon>delete_sweep</mat-icon>
+                放弃全部
+              </button>
+              <button
+                mat-flat-button
+                color="primary"
+                type="button"
+                [disabled]="!pendingChanges().length || state.saving"
+                (click)="saveAll()"
+              >
+                <mat-icon>save</mat-icon>
+                保存全部
+              </button>
+            </div>
+            @if (pendingChanges().length) {
+              <div class="session-panel__chips">
+                @for (change of pendingChanges(); track change.id + '::' + change.key) {
+                  <span class="pending-chip" [matTooltip]="'原值：' + change.baseValue">
+                    {{ change.orderNo }} · {{ columnLabel(change.key) }} → {{ change.value }}
+                  </span>
+                }
+              </div>
+            }
+            @if (conflictItems().length) {
+              <div class="conflict-zone">
+                <p class="conflict-zone__title">
+                  <mat-icon>report</mat-icon>
+                  以下单元格版本落后于服务端，本地值未覆盖服务端，可重试或放弃：
+                </p>
+                @for (conflict of conflictItems(); track conflict.id + '::' + conflict.key) {
+                  <div class="conflict-row">
+                    <span class="conflict-row__cell">{{ conflict.orderNo }} · {{ columnLabel(conflict.key) }}</span>
+                    <span class="conflict-row__local">本地：{{ conflict.localValue }}</span>
+                    <span class="conflict-row__server">服务端：{{ conflict.serverValue }}</span>
+                    <span class="spacer"></span>
+                    <button mat-stroked-button type="button" (click)="retryConflict(conflict)">重试</button>
+                    <button mat-button type="button" (click)="discardConflict(conflict)">放弃</button>
+                  </div>
+                }
+              </div>
+            }
+          </section>
+        }
+
         @if (state.groups.length) {
           <section class="group-strip">
             @for (group of state.groups.slice(0, 6); track group.key) {
@@ -263,6 +346,12 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             @if (state.selectedIds.length) {
               <span class="selection-note">已选择 {{ state.selectedIds.length }} 行</span>
             }
+            @if (pendingChanges().length) {
+              <span class="pending-note">待提交 {{ pendingChanges().length }}</span>
+            }
+            @if (conflictItems().length) {
+              <span class="conflict-note">冲突 {{ conflictItems().length }}</span>
+            }
             <span class="spacer"></span>
             <span class="muted">双击单元格可内联编辑</span>
           </div>
@@ -277,6 +366,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             [sort]="state.sort"
             [selectedIds]="state.selectedIds"
             [dirtyCells]="state.dirtyCells"
+            [conflicts]="state.conflicts"
             [expandedIds]="state.expandedIds"
             [treeMode]="state.treeMode"
             (sortChange)="changeSort($event)"
@@ -539,6 +629,98 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       color: #667085;
       font-size: 12px;
     }
+    .session-panel {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border: 1px solid #fedf89;
+      border-radius: 12px;
+      background: #fffaeb;
+    }
+    .session-panel__head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .session-panel__head > mat-icon {
+      color: #b54708;
+    }
+    .session-panel__title strong,
+    .session-panel__title span {
+      display: block;
+    }
+    .session-panel__title strong {
+      font-size: 13px;
+    }
+    .session-panel__title .muted {
+      color: #98a2b3;
+      font-size: 11px;
+    }
+    .save-error {
+      color: #b42318;
+      font-size: 12px;
+    }
+    .session-panel__chips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .pending-chip {
+      padding: 3px 9px;
+      border: 1px solid #fedf89;
+      border-radius: 999px;
+      background: #fff;
+      color: #b54708;
+      font-size: 11px;
+    }
+    .conflict-zone {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid #fecdca;
+      border-radius: 9px;
+      background: #fffbfa;
+    }
+    .conflict-zone__title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0 0 6px;
+      color: #b42318;
+      font-size: 12px;
+    }
+    .conflict-zone__title mat-icon {
+      font-size: 17px;
+      width: 17px;
+      height: 17px;
+    }
+    .conflict-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 5px 0;
+      border-top: 1px dashed #fecdca;
+      font-size: 12px;
+    }
+    .conflict-row__cell {
+      min-width: 200px;
+      color: #172033;
+      font-weight: 600;
+    }
+    .conflict-row__local {
+      color: #b54708;
+    }
+    .conflict-row__server {
+      color: #027a48;
+    }
+    .pending-note {
+      margin-left: 12px;
+      color: #b54708;
+    }
+    .conflict-note {
+      margin-left: 12px;
+      color: #b42318;
+    }
     .group-strip {
       display: grid;
       grid-template-columns: repeat(6, minmax(130px, 1fr));
@@ -632,11 +814,14 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
 export class AppComponent {
   private readonly store = inject(Store);
   private readonly snackBar = inject(MatSnackBar);
+  private readonly api = inject(MockTableApiService);
 
   readonly tableState = this.store.selectSignal(selectTableState);
   readonly allColumns = this.store.selectSignal(selectAllColumnDefinitions);
   readonly visibleColumns = this.store.selectSignal(selectVisibleColumnDefinitions) as unknown as () => GridColumn[];
   readonly pageCount = this.store.selectSignal(selectPageCount);
+  readonly pendingChanges = this.store.selectSignal(selectPendingChanges);
+  readonly conflictItems = this.store.selectSignal(selectConflictItems);
   readonly showFilterPanel = signal(false);
   readonly conditionCount = computed(() => this.countConditions(this.tableState().filter));
   readonly compactAmount = computed(() => {
@@ -647,7 +832,25 @@ export class AppComponent {
   });
 
   constructor() {
+    // 其他标签页保存后，共享存储里的数据版本会变化，本页旧查询结果随之失效
+    window.addEventListener('storage', (event: StorageEvent) => {
+      if (event.key !== SERVER_STORAGE_KEY || !event.newValue) {
+        return;
+      }
+      try {
+        const snapshot = JSON.parse(event.newValue) as ServerSnapshot;
+        this.store.dispatch(TableActions.externalDataChanged({
+          dataVersion: snapshot.dataVersion,
+          cellVersions: this.api.cellVersionsOf(snapshot),
+        }));
+      } catch {
+        // 无法解析的广播直接忽略
+      }
+    });
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
+    if (this.tableState().sessionRestored) {
+      this.snackBar.open('已恢复上次未提交的修改与冲突项，可继续编辑或保存', '关闭', { duration: 3200 });
+    }
   }
 
   refresh(): void {
@@ -738,6 +941,44 @@ export class AppComponent {
     this.snackBar.open('单元格已更新，将进入待提交变更区', '关闭', { duration: 1600 });
   }
 
+  saveAll(): void {
+    this.store.dispatch(TableActions.saveDirtyCells());
+  }
+
+  discardAll(): void {
+    this.store.dispatch(TableActions.discardDirtyCells());
+    this.snackBar.open('已放弃全部待提交修改', '关闭', { duration: 1800 });
+  }
+
+  retryConflict(conflict: ConflictItem): void {
+    this.store.dispatch(TableActions.retryConflict({ id: conflict.id, key: conflict.key }));
+  }
+
+  discardConflict(conflict: ConflictItem): void {
+    this.store.dispatch(TableActions.discardConflict({ id: conflict.id, key: conflict.key }));
+  }
+
+  simulateExternalEdit(): void {
+    const first = this.pendingChanges()[0];
+    if (!first) {
+      return;
+    }
+    const snapshot = this.api.simulateExternalEdit(first.id, first.key);
+    this.store.dispatch(TableActions.externalDataChanged({
+      dataVersion: snapshot.dataVersion,
+      cellVersions: this.api.cellVersionsOf(snapshot),
+    }));
+    this.snackBar.open(
+      `另一个标签页修改了 ${first.orderNo} 的${this.columnLabel(first.key)}，保存时将按单元格版本裁决`,
+      '关闭',
+      { duration: 2800 },
+    );
+  }
+
+  columnLabel(key: keyof TableRow): string {
+    return this.allColumns().find((column) => column.key === key)?.label ?? String(key);
+  }
+
   toggleExpand(id: string): void {
     this.store.dispatch(TableActions.toggleExpanded({ id }));
   }
@@ -776,15 +1017,48 @@ export class AppComponent {
   }
 
   exportCsv(): void {
+    const state = this.tableState();
     const columns = this.visibleColumns();
-    const header = columns.map((column) => column.label).join(',');
-    const rows = this.tableState().rows.map((row) =>
-      columns.map((column) => `"${String(row[column.key] ?? '').replaceAll('"', '""')}"`).join(','),
-    );
-    const blob = new Blob([`\uFEFF${[header, ...rows].join('\n')}`], { type: 'text/csv;charset=utf-8' });
+    const pending = this.pendingChanges();
+    const conflicts = this.conflictItems();
+    const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+
+    // 已保存值：剥离待提交覆盖，还原服务端当前已保存的内容
+    const savedRows = state.rows.map((row) => {
+      let next = row;
+      for (const change of pending) {
+        if (change.id === row.id) {
+          next = next === row ? { ...row, [change.key]: change.baseValue } : { ...next, [change.key]: change.baseValue };
+        }
+      }
+      return next;
+    });
+
+    const lines: string[] = [
+      '【已保存值】',
+      columns.map((column) => column.label).join(','),
+      ...savedRows.map((row) => columns.map((column) => escape(row[column.key])).join(',')),
+      '',
+      '【待提交值】',
+      '订单号,字段,原值,待提交值',
+      ...pending.map((change) =>
+        [change.orderNo, this.columnLabel(change.key), change.baseValue, change.value]
+          .map(escape)
+          .join(','),
+      ),
+      '',
+      '【冲突项】',
+      '订单号,字段,本地值,服务端值',
+      ...conflicts.map((conflict) =>
+        [conflict.orderNo, this.columnLabel(conflict.key), conflict.localValue, conflict.serverValue]
+          .map(escape)
+          .join(','),
+      ),
+    ];
+    const blob = new Blob([`\uFEFF${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `销售订单-第${this.tableState().page + 1}页.csv`;
+    link.download = `销售订单-第${state.page + 1}页.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
   }

@@ -34,3 +34,13 @@ export const selectSelectionMode = createSelector(
     count: state.selectedIds.length,
   }),
 );
+
+export const selectPendingChanges = createSelector(
+  selectTableState,
+  (state) => Object.values(state.dirtyCells),
+);
+
+export const selectConflictItems = createSelector(
+  selectTableState,
+  (state) => Object.values(state.conflicts),
+);

@@ -90,6 +90,61 @@ export interface QueryResult {
   aggregates: AggregateResult;
   groups: GroupSummary[];
   elapsedMs: number;
+  dataVersion: number;
+  cellVersions: Record<string, number>;
+}
+
+export interface PendingChange {
+  id: string;
+  key: keyof TableRow;
+  orderNo: string;
+  value: CellValue;
+  baseValue: CellValue;
+  baseVersion: number;
+}
+
+export interface ConflictItem {
+  id: string;
+  key: keyof TableRow;
+  orderNo: string;
+  localValue: CellValue;
+  serverValue: CellValue;
+  serverVersion: number;
+}
+
+export interface CellChange {
+  id: string;
+  key: keyof TableRow;
+  value: CellValue;
+  baseVersion: number;
+}
+
+export interface SavedCell {
+  id: string;
+  key: keyof TableRow;
+  value: CellValue;
+  version: number;
+}
+
+export interface SaveBatchResult {
+  saved: SavedCell[];
+  conflicts: ConflictItem[];
+  dataVersion: number;
+}
+
+export interface SessionSnapshot {
+  savedAt: string;
+  page: number;
+  pageSize: number;
+  sort: SortState | null;
+  filter: FilterGroup;
+  search: string;
+  groupBy: keyof TableRow | null;
+  treeMode: boolean;
+  dirtyCells: Record<string, PendingChange>;
+  conflicts: Record<string, ConflictItem>;
+  cellVersions: Record<string, number>;
+  dataVersion: number;
 }
 
 export interface SavedView {
@@ -129,5 +184,12 @@ export interface TableState {
   elapsedMs: number;
   savedViews: SavedView[];
   activeViewId: string | null;
-  dirtyCells: Record<string, CellValue>;
+  dirtyCells: Record<string, PendingChange>;
+  conflicts: Record<string, ConflictItem>;
+  cellVersions: Record<string, number>;
+  queryVersion: number;
+  dataVersion: number;
+  saving: boolean;
+  saveError: string | null;
+  sessionRestored: boolean;
 }

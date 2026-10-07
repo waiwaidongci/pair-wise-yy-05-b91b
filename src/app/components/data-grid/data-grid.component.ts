@@ -15,7 +15,7 @@ import { MatCheckboxModule } from '@angular/material/checkbox';
 import { MatIconModule } from '@angular/material/icon';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatTooltipModule } from '@angular/material/tooltip';
-import { CellValue, GroupSummary, SortState, TableRow } from '../../types/table.models';
+import { CellValue, ConflictItem, PendingChange, SortState, TableRow } from '../../types/table.models';
 
 export interface GridColumn {
   key: keyof TableRow;
@@ -97,6 +97,7 @@ export interface GridColumn {
             [class.grid-row--selected]="selectedIds.includes(row.id)"
             [class.grid-row--active]="activeIndex === rowIndex"
             [class.grid-row--dirty]="dirtyIds.has(row.id)"
+            [class.grid-row--conflict]="conflictIds.has(row.id)"
             [style.min-width.px]="gridWidth + 54"
             [style.height.px]="rowHeight"
             (click)="activate(rowIndex)"
@@ -225,6 +226,15 @@ export interface GridColumn {
       background: #f79009;
       content: '';
     }
+    .grid-row--conflict::after {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 3px;
+      height: 100%;
+      background: #f04438;
+      content: '';
+    }
     .grid-row--tree-child .cell:first-of-type {
       padding-left: 30px;
     }
@@ -341,7 +351,8 @@ export class DataGridComponent implements AfterViewInit {
   @Input() density: 'compact' | 'standard' | 'comfortable' = 'standard';
   @Input() sort: SortState | null = null;
   @Input() selectedIds: string[] = [];
-  @Input() dirtyCells: Record<string, CellValue> = {};
+  @Input() dirtyCells: Record<string, PendingChange> = {};
+  @Input() conflicts: Record<string, ConflictItem> = {};
   @Input() expandedIds: string[] = [];
   @Input() treeMode = false;
 
@@ -385,6 +396,10 @@ export class DataGridComponent implements AfterViewInit {
 
   get dirtyIds(): Set<string> {
     return new Set(Object.keys(this.dirtyCells).map((key) => key.split('::')[0]));
+  }
+
+  get conflictIds(): Set<string> {
+    return new Set(Object.keys(this.conflicts).map((key) => key.split('::')[0]));
   }
 
   ngAfterViewInit(): void {
